@@ -25,10 +25,121 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string(name="test_csv_for_ids_path", default="../data/test.csv", help="")
 flags.DEFINE_string(name="test_csv_path", default="../shrunken_data/test.csv", help="")
-flags.DEFINE_string(name="train_file_path", default="../gnn_data/train.pt", help="")
+flags.DEFINE_string(name="train_file_csv_path", default="../shrunken_data/train.csv", help="")
 flags.DEFINE_string(name="test_file_path", default="../gnn_data/test.pt", help="")
 flags.DEFINE_string(name="results_dir", default="results", help="")
+flags.DEFINE_string(name="output_file_name", default="ids_pred_results.csv", help="")
+flags.DEFINE_string(name="saving_model_path", default="ids_pred_results.csv", help="")
 
+
+
+flags.DEFINE_integer(name="featurizing_batch_size", default=256, help="")
+flags.DEFINE_integer(name="shard_size", default=100000, help="")
+flags.DEFINE_integer(name="dev_num", default=0, help="")
+
+
+
+
+def one_hot_encoding(x, permitted_list):
+    """
+    Maps input elements x which are not in the permitted list to the last element
+    of the permitted list.
+    """
+    if x not in permitted_list:
+        x = permitted_list[-1]
+    binary_encoding = [int(boolean_value) for boolean_value in list(map(lambda s: x == s, permitted_list))]
+    return binary_encoding
+    
+    
+# Main atom feat. func
+
+def get_atom_features(atom, use_chirality=True):
+    # Define a simplified list of atom types
+    permitted_atom_types = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I','Dy', 'Unknown']
+    atom_type = atom.GetSymbol() if atom.GetSymbol() in permitted_atom_types else 'Unknown'
+    atom_type_enc = one_hot_encoding(atom_type, permitted_atom_types)
+    
+    # Consider only the most impactful features: atom degree and whether the atom is in a ring
+    atom_degree = one_hot_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 'MoreThanFour'])
+    is_in_ring = [int(atom.IsInRing())]
+    
+    #print(atom_degree)
+    #exit()
+    # Optionally include chirality
+    if use_chirality:
+        chirality_enc = one_hot_encoding(str(atom.GetChiralTag()), ["CHI_UNSPECIFIED", "CHI_TETRAHEDRAL_CW", "CHI_TETRAHEDRAL_CCW", "CHI_OTHER"])
+        atom_features = atom_type_enc + atom_degree + is_in_ring + chirality_enc
+    else:
+        atom_features = atom_type_enc + atom_degree + is_in_ring
+    
+    return np.array(atom_features, dtype=np.float32)
+
+# Bond featurization
+
+def get_bond_features(bond):
+    # Simplified list of bond types
+    permitted_bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC, 'Unknown']
+    bond_type = bond.GetBondType() if bond.GetBondType() in permitted_bond_types else 'Unknown'
+    
+    # Features: Bond type, Is in a ring
+    features = one_hot_encoding(bond_type, permitted_bond_types) \
+               + [int(bond.IsInRing())]
+    
+    return np.array(features, dtype=np.float32)
+
+
+def create_pytorch_geometric_graph_data_list_from_smiles_and_labels(x_smiles, y=None):
+    data_list = []
+    
+    for index, smiles in enumerate(x_smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        
+        if not mol:  # Skip invalid SMILES strings
+            continue
+        
+        # Node features
+        atom_features = [get_atom_features(atom) for atom in mol.GetAtoms()]
+        x = torch.tensor(atom_features, dtype=torch.float)
+        
+        # Edge features
+        edge_index = []
+        edge_features = []
+        for bond in mol.GetBonds():
+            start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            edge_index += [(start, end), (end, start)]  # Undirected graph
+            bond_feature = get_bond_features(bond)
+            edge_features += [bond_feature, bond_feature]  # Same features in both directions
+        
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_features, dtype=torch.float)
+        
+        # Creating the Data object
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+        #data.molecule_id = ids[index]
+        if y is not None:
+            data.y = torch.tensor([y[index]], dtype=torch.float)
+        
+        data_list.append(data)
+    
+    return data_list
+
+def featurize_data_in_batches(smiles_list, labels_list, batch_size):
+    data_list = []
+    # Define tqdm progress bar
+    #pbar = tqdm(total=len(smiles_list), desc="Featurizing data")
+    for i in range(0, len(smiles_list), batch_size):
+        smiles_batch = smiles_list[i:i+batch_size]
+        if labels_list is not None:
+            labels_batch = labels_list[i:i+batch_size]
+        else:
+            labels_batch = None
+        #ids_batch = ids_list[i:i+batch_size]
+        batch_data_list = create_pytorch_geometric_graph_data_list_from_smiles_and_labels(smiles_batch, labels_batch)
+        data_list.extend(batch_data_list)
+        #pbar.update(len(smiles_batch))
+        
+    #pbar.close()
+    return data_list
 
 
 class CustomGNNLayer(MessagePassing):
@@ -73,34 +184,59 @@ class GNNModel(nn.Module):
 
 
 
-def train_model(train_loader, num_epochs, input_dim, hidden_dim, num_layers, dropout_rate,out_channels, lr):
-    model = GNNModel(input_dim, hidden_dim, num_layers, dropout_rate,out_channels)
+def train_model(df_train, num_epochs, input_dim, hidden_dim, num_layers, dropout_rate,out_channels, lr,
+                featurizing_batch_size=64,training_batch_size=32,shard_size=10000,shuffle = True,device = 'cuda:1'):
+    # define model and loss
+    model = GNNModel(input_dim, hidden_dim, num_layers, dropout_rate,out_channels).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     criterion = BCEWithLogitsLoss()
     
+    # iteration over the training samples
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        for batch in train_loader:
-            optimizer.zero_grad()
-            out = model(batch)
-            #loss = criterion(out, batch.y.view(-1, 1).float()) # ??
-            loss = criterion(out, batch.y.float())
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {total_loss / len(train_loader)}')
+        if shuffle:
+            df_train = df_train.sample(frac=1)
+            
+        shard_ind = 0
+        num_mini_batches = 0
+        # iteration over shard_size of the training samples
+        for i in range(0, len(df_train), shard_size):
+            shard_ind +=1
+            print(f"featurizing shard {shard_ind} / {len(df_train)// shard_size}")
+            df_train_shard = df_train[i:i+shard_size]
+            smiles_list_train = df_train_shard['molecule_smiles'].tolist()
+            labels_list = df_train_shard[['binds_BRD4','binds_HSA','binds_sEH']].values
+            train_data = featurize_data_in_batches(smiles_list_train, labels_list, featurizing_batch_size)
+            
+            train_loader = DataLoader(train_data, batch_size=training_batch_size, shuffle=True)
+
+            # iteration over the train_loader mini-batchs
+            print(f"Training on shard {shard_ind} / {len(df_train)// shard_size}")
+            for batch in train_loader:
+                num_mini_batches +=1
+                optimizer.zero_grad()
+                batch = batch.to(device)
+                out = model(batch)
+                #loss = criterion(out, batch.y.view(-1, 1).float()) # ??
+                loss = criterion(out, batch.y.float())
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+ 
+
+        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {total_loss / num_mini_batches}')
     
     return model
 
-def predict_with_model(model, test_loader):
+def predict_with_model(model, test_loader,device):
     model.eval()
     predictions = []
     #molecule_ids = []
 
     with torch.no_grad():
         for data in tqdm(test_loader):
-            output = torch.sigmoid(model(data))
+            output = torch.sigmoid(model(data.to(device)))
             predictions.extend(output.view(-1).tolist())
             #molecule_ids.extend(data.molecule_id)
 
@@ -132,29 +268,46 @@ def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_
 
 def main(argv):
     print('loading training samples')    
-    train_data = torch.load(FLAGS.train_file_path)
+    #train_data = torch.load(FLAGS.train_file_path)
     # Train model
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-    input_dim = train_loader.dataset[0].num_node_features
+    #train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+    
+    df_train = pd.read_csv(FLAGS.train_file_csv_path)
+    
+    # simple featurization to get input dimension
+    df_train_simple = df_train[:128]
+    smiles_list_train = df_train_simple['molecule_smiles'].tolist()
+    labels_list = df_train_simple[['binds_BRD4','binds_HSA','binds_sEH']].values
+    train_data = featurize_data_in_batches(smiles_list_train, labels_list, 64)
+
+    input_dim = train_data[0].num_node_features
     hidden_dim = 64
     num_epochs = 11
     num_layers = 4 #Should ideally be set so that all nodes can communicate with each other
     dropout_rate = 0.3
     lr = 0.001
     out_channels =3
+    
     #These are just example values, feel free to play around with them.
-    model = train_model(train_loader,num_epochs, input_dim, hidden_dim,num_layers, dropout_rate,out_channels, lr)
+    #model = train_model(train_loader,num_epochs, input_dim, hidden_dim,num_layers, dropout_rate,out_channels, lr)
+    device = "cuda:"+str(FLAGS.dev_num)
+    model = train_model(df_train, num_epochs, input_dim, hidden_dim, num_layers, dropout_rate,out_channels, lr,
+                featurizing_batch_size=FLAGS.featurizing_batch_size,training_batch_size=32,shard_size=FLAGS.shard_size,shuffle = True,device = device)
+    
+    #saving model
+    torch.save(model.state_dict(), FLAGS.saving_model_path)
 
     print('loading test samples')    
     test_data = torch.load(FLAGS.test_file_path)
     test_df = pd.read_csv(FLAGS.test_csv_path)
     # Predict
     test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
-    predictions = predict_with_model(model, test_loader)
+    predictions = predict_with_model(model, test_loader,device=device)
     
     # save predictions
     
-    _ = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path,output_dir = FLAGS.results_dir)
+    _ = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path,output_dir = FLAGS.results_dir
+                                             ,output_file_name = FLAGS.output_file_name)
 
         
 if __name__ == "__main__":
