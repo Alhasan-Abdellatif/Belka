@@ -1,3 +1,4 @@
+import math
 import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 import os
@@ -6,6 +7,7 @@ import torch
 from torch_geometric.data import Data
 from tqdm import tqdm
 from absl import app, flags
+from multiprocessing import Pool
 
 
 # Atom Featurisation
@@ -14,149 +16,232 @@ from absl import app, flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string(name="train_file_path", default="../shrunken_data/train.csv", help="")
-flags.DEFINE_string(name="test_file_path", default="../shrunken_data/test.csv", help="")
+flags.DEFINE_string(name="csv_file_path", default="../shrunken_data/train.csv", help="")
 flags.DEFINE_string(name="output_folder", default="../gnn_data/", help="")
-flags.DEFINE_string(name="output_train_file_name", default="train.pt", help="")
-flags.DEFINE_string(name="output_test_file_name", default="test.pt", help="")
-flags.DEFINE_string(name="data_type", default="both", help="type of data to featurize both, train_only, test_only")
+flags.DEFINE_string(name="output_file_name", default="train.pt", help="")
 
-def one_hot_encoding(x, permitted_list):
-    """
-    Maps input elements x which are not in the permitted list to the last element
-    of the permitted list.
-    """
-    if x not in permitted_list:
-        x = permitted_list[-1]
-    binary_encoding = [int(boolean_value) for boolean_value in list(map(lambda s: x == s, permitted_list))]
-    return binary_encoding
-    
-    
-# Main atom feat. func
+flags.DEFINE_boolean(
+    name="is_labeled",
+    default=False,
+    help=""
+)
 
-def get_atom_features(atom, use_chirality=True):
-    # Define a simplified list of atom types
-    permitted_atom_types = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I','Dy', 'Unknown']
-    atom_type = atom.GetSymbol() if atom.GetSymbol() in permitted_atom_types else 'Unknown'
-    atom_type_enc = one_hot_encoding(atom_type, permitted_atom_types)
-    
-    # Consider only the most impactful features: atom degree and whether the atom is in a ring
-    atom_degree = one_hot_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 'MoreThanFour'])
-    is_in_ring = [int(atom.IsInRing())]
-    
-    #print(atom_degree)
-    #exit()
-    # Optionally include chirality
-    if use_chirality:
-        chirality_enc = one_hot_encoding(str(atom.GetChiralTag()), ["CHI_UNSPECIFIED", "CHI_TETRAHEDRAL_CW", "CHI_TETRAHEDRAL_CCW", "CHI_OTHER"])
-        atom_features = atom_type_enc + atom_degree + is_in_ring + chirality_enc
-    else:
-        atom_features = atom_type_enc + atom_degree + is_in_ring
-    
-    return np.array(atom_features, dtype=np.float32)
+# torch version of np unpackbits
+#https://gist.github.com/vadimkantorov/30ea6d278bc492abf6ad328c6965613a
 
-# Bond featurization
+def tensor_dim_slice(tensor, dim, dim_slice):
+	return tensor[(dim if dim >= 0 else dim + tensor.dim()) * (slice(None),) + (dim_slice,)]
 
-def get_bond_features(bond):
-    # Simplified list of bond types
-    permitted_bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC, 'Unknown']
-    bond_type = bond.GetBondType() if bond.GetBondType() in permitted_bond_types else 'Unknown'
-    
-    # Features: Bond type, Is in a ring
-    features = one_hot_encoding(bond_type, permitted_bond_types) \
-               + [int(bond.IsInRing())]
-    
-    return np.array(features, dtype=np.float32)
+# @torch.jit.script
+def packshape(shape, dim: int = -1, mask: int = 0b00000001, dtype=torch.uint8, pack=True):
+	dim = dim if dim >= 0 else dim + len(shape)
+	bits, nibble = (
+		8 if dtype is torch.uint8 else 16 if dtype is torch.int16 else 32 if dtype is torch.int32 else 64 if dtype is torch.int64 else 0), (
+		1 if mask == 0b00000001 else 2 if mask == 0b00000011 else 4 if mask == 0b00001111 else 8 if mask == 0b11111111 else 0)
+	# bits = torch.iinfo(dtype).bits # does not JIT compile
+	assert nibble <= bits and bits % nibble == 0
+	nibbles = bits // nibble
+	shape = (shape[:dim] + (int(math.ceil(shape[dim] / nibbles)),) + shape[1 + dim:]) if pack else (
+				shape[:dim] + (shape[dim] * nibbles,) + shape[1 + dim:])
+	return shape, nibbles, nibble
+
+# @torch.jit.script
+def F_unpackbits(tensor, dim: int = -1, mask: int = 0b00000001, shape=None, out=None, dtype=torch.uint8):
+	dim = dim if dim >= 0 else dim + tensor.dim()
+	shape_, nibbles, nibble = packshape(tensor.shape, dim=dim, mask=mask, dtype=tensor.dtype, pack=False)
+	shape = shape if shape is not None else shape_
+	out = out if out is not None else torch.empty(shape, device=tensor.device, dtype=dtype)
+	assert out.shape == shape
+
+	if shape[dim] % nibbles == 0:
+		shift = torch.arange((nibbles - 1) * nibble, -1, -nibble, dtype=torch.uint8, device=tensor.device)
+		shift = shift.view(nibbles, *((1,) * (tensor.dim() - dim - 1)))
+		return torch.bitwise_and((tensor.unsqueeze(1 + dim) >> shift).view_as(out), mask, out=out)
+
+	else:
+		for i in range(nibbles):
+			shift = nibble * i
+			sliced_output = tensor_dim_slice(out, dim, slice(i, None, nibbles))
+			sliced_input = tensor.narrow(dim, 0, sliced_output.shape[dim])
+			torch.bitwise_and(sliced_input >> shift, mask, out=sliced_output)
+	return out
+
+class dotdict(dict):
+	__setattr__ = dict.__setitem__
+	__delattr__ = dict.__delitem__
+	
+	def __getattr__(self, name):
+		try:
+			return self[name]
+		except KeyError:
+			raise AttributeError(name)
 
 
-def create_pytorch_geometric_graph_data_list_from_smiles_and_labels(x_smiles, y=None):
-    data_list = []
-    
-    for index, smiles in enumerate(x_smiles):
-        mol = Chem.MolFromSmiles(smiles)
-        
-        if not mol:  # Skip invalid SMILES strings
-            continue
-        
-        # Node features
-        atom_features = [get_atom_features(atom) for atom in mol.GetAtoms()]
-        x = torch.tensor(atom_features, dtype=torch.float)
-        
-        # Edge features
-        edge_index = []
-        edge_features = []
-        for bond in mol.GetBonds():
-            start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-            edge_index += [(start, end), (end, start)]  # Undirected graph
-            bond_feature = get_bond_features(bond)
-            edge_features += [bond_feature, bond_feature]  # Same features in both directions
-        
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-        edge_attr = torch.tensor(edge_features, dtype=torch.float)
-        
-        # Creating the Data object
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-        #data.molecule_id = ids[index]
-        if y is not None:
-            data.y = torch.tensor([y[index]], dtype=torch.float)
-        
-        data_list.append(data)
-    
-    return data_list
+# mol to graph adopted from
+# from https://github.com/LiZhang30/GPCNDTA/blob/main/utils/DrugGraph.py
 
-def featurize_data_in_batches(smiles_list, labels_list, batch_size):
-    data_list = []
-    # Define tqdm progress bar
-    pbar = tqdm(total=len(smiles_list), desc="Featurizing data")
-    for i in range(0, len(smiles_list), batch_size):
-        smiles_batch = smiles_list[i:i+batch_size]
-        if labels_list is not None:
-            labels_batch = labels_list[i:i+batch_size]
+PACK_NODE_DIM=9
+PACK_EDGE_DIM=1
+NODE_DIM=PACK_NODE_DIM*8
+EDGE_DIM=PACK_EDGE_DIM*8
+
+def one_of_k_encoding(x, allowable_set, allow_unk=False):
+	if x not in allowable_set:
+		if allow_unk:
+			x = allowable_set[-1]
+		else:
+			raise Exception(f'input {x} not in allowable set{allowable_set}!!!')
+	return list(map(lambda s: x == s, allowable_set))
+
+
+#Get features of an atom (one-hot encoding:)
+'''
+	1.atom element: 44+1 dimensions    
+	2.the atom's hybridization: 5 dimensions
+	3.degree of atom: 6 dimensions                        
+	4.total number of H bound to atom: 6 dimensions
+	5.number of implicit H bound to atom: 6 dimensions    
+	6.whether the atom is on ring: 1 dimension
+	7.whether the atom is aromatic: 1 dimension           
+	Total: 70 dimensions
+'''
+
+ATOM_SYMBOL = [
+	'C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg',
+	'Na', 'Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl',
+	'Yb', 'Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H',
+	'Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr', 'Cr',
+	'Pt', 'Hg', 'Pb', 'Dy',
+	#'Unknown'
+]
+#print('ATOM_SYMBOL', len(ATOM_SYMBOL))44
+HYBRIDIZATION_TYPE = [
+	Chem.rdchem.HybridizationType.S,
+	Chem.rdchem.HybridizationType.SP,
+	Chem.rdchem.HybridizationType.SP2,
+	Chem.rdchem.HybridizationType.SP3,
+	Chem.rdchem.HybridizationType.SP3D
+]
+
+def get_atom_feature(atom):
+	feature = (
+		 one_of_k_encoding(atom.GetSymbol(), ATOM_SYMBOL)
+	   + one_of_k_encoding(atom.GetHybridization(), HYBRIDIZATION_TYPE)
+	   + one_of_k_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 5])
+	   + one_of_k_encoding(atom.GetTotalNumHs(), [0, 1, 2, 3, 4, 5])
+	   + one_of_k_encoding(atom.GetImplicitValence(), [0, 1, 2, 3, 4, 5])
+	   + [atom.IsInRing()]
+	   + [atom.GetIsAromatic()]
+	)
+	#feature = np.array(feature, dtype=np.uint8)
+	#print(torch.tensor(feature,dtype=int))
+	feature = np.packbits(feature)
+	#print(feature)
+	#print(F_unpackbits(torch.tensor(feature)))
+	if torch.any(F_unpackbits(torch.tensor(feature))[-3:] != 0):
+		raise Exception('Problem unpacking')
+	return feature
+
+
+#Get features of an edge (one-hot encoding)
+'''
+	1.single/double/triple/aromatic: 4 dimensions       
+	2.the atom's hybridization: 1 dimensions
+	3.whether the bond is on ring: 1 dimension          
+	Total: 6 dimensions
+'''
+
+def get_bond_feature(bond):
+	bond_type = bond.GetBondType()
+	feature = [
+		bond_type == Chem.rdchem.BondType.SINGLE,
+		bond_type == Chem.rdchem.BondType.DOUBLE,
+		bond_type == Chem.rdchem.BondType.TRIPLE,
+		bond_type == Chem.rdchem.BondType.AROMATIC,
+		bond.GetIsConjugated(),
+		bond.IsInRing()
+	]
+	#feature = np.array(feature, dtype=np.uint8)
+	feature = np.packbits(feature)
+	return feature
+
+
+def smile_to_graph(smiles):
+	mol = Chem.MolFromSmiles(smiles)
+	N = mol.GetNumAtoms()
+	node_feature = []
+	edge_feature = []
+	edge = []
+	for i in range(mol.GetNumAtoms()):
+		atom_i = mol.GetAtomWithIdx(i)
+		atom_i_features = get_atom_feature(atom_i)
+		node_feature.append(atom_i_features)
+
+		for j in range(mol.GetNumAtoms()):
+			bond_ij = mol.GetBondBetweenAtoms(i, j)
+			if bond_ij is not None:
+				edge.append([i, j])
+				bond_features_ij = get_bond_feature(bond_ij)
+				edge_feature.append(bond_features_ij)
+	node_feature=np.stack(node_feature)
+	edge_feature=np.stack(edge_feature)
+	edge = np.array(edge,dtype=np.uint8)
+	return N,edge,node_feature,edge_feature
+
+def to_pyg_format(N,edge,node_feature,edge_feature):
+	graph = Data(
+		idx=-1,
+		edge_index = torch.from_numpy(edge.T).int(),
+		x          = torch.from_numpy(node_feature).byte(),
+		edge_attr  = torch.from_numpy(edge_feature).byte(),
+	)
+	return graph
+
+def to_pyg_list(graph,labels=None):
+    L = len(graph)
+    for i in range(L):
+        N, edge, node_feature, edge_feature = graph[i]
+        if labels is not None:
+            y = np.reshape(labels[i],(1,len(labels[i])))
+            y = torch.tensor(y, dtype=torch.float)
         else:
-            labels_batch = None
-        #ids_batch = ids_list[i:i+batch_size]
-        batch_data_list = create_pytorch_geometric_graph_data_list_from_smiles_and_labels(smiles_batch, labels_batch)
-        data_list.extend(batch_data_list)
-        pbar.update(len(smiles_batch))
-        
-    pbar.close()
-    return data_list
+            y = None
+        graph[i] = Data(
+            idx=i,
+            edge_index=torch.from_numpy(edge.T).int(),
+            x=torch.from_numpy(node_feature).byte(),
+            edge_attr=torch.from_numpy(edge_feature).byte(),
+            y = y
+        )    
+    return graph
 
 
 def main(argv):
-    dtypes = {'buildingblock1_smiles': np.int16, 'buildingblock2_smiles': np.int16, 'buildingblock3_smiles': np.int16,
-            'binds_BRD4':np.byte, 'binds_HSA':np.byte, 'binds_sEH':np.byte}
+    #dtypes = {'buildingblock1_smiles': np.int16, 'buildingblock2_smiles': np.int16, 'buildingblock3_smiles': np.int16,
+    #        'binds_BRD4':np.byte, 'binds_HSA':np.byte, 'binds_sEH':np.byte}
       
-    
     os.makedirs(FLAGS.output_folder, exist_ok=True)
 
-    if FLAGS.data_type =='both' or FLAGS.data_type =='train_only': 
-        print('loading training samples')    
-        df_train = pd.read_csv(FLAGS.train_file_path, dtype = dtypes)
-        #df_train = train[:3000]
-        print('Num training sampls: ',len(df_train))  
-        print('----Featurizing training data -----')
-        # Define the batch size for featurization
-        batch_size = 2**8
-        smiles_list_train = df_train['molecule_smiles'].tolist()
+    print('loading samples')    
+    df_train = pd.read_csv(FLAGS.csv_file_path)#, dtype = dtypes)
+    #df_train = df_train[:3000]
+    print('Num training sampls: ',len(df_train))  
+    print('----Featurizing training data -----')
+    smiles_list = df_train['molecule_smiles'].tolist()
+    if FLAGS.is_labeled:
         labels_list = df_train[['binds_BRD4','binds_HSA','binds_sEH']].values
-        train_data = featurize_data_in_batches(smiles_list_train, labels_list, batch_size)
-        torch.save(train_data,os.path.join(FLAGS.output_folder,FLAGS.output_train_file_name))
-    if FLAGS.data_type =='both' or FLAGS.data_type =='test_only': 
-        print('loading testing samples')    
-        df_test = pd.read_csv(FLAGS.test_file_path, dtype = dtypes)
-        #df_test= test
-        print('Num testnig samples: ',len(df_test))
-        print('----Featurizing test data -----')
-        # Define the batch size for featurization
-        smiles_list_test = df_test['molecule_smiles'].tolist()
-        #labels_list = test[['binds_BRD4','binds_HSA','binds_sEH']].values
-        test_data = featurize_data_in_batches(smiles_list_test, None, batch_size)
-        torch.save(test_data,os.path.join(FLAGS.output_folder,FLAGS.output_test_file_name))
+    else:
+        labels_list = None
+    
+    num_train= len(smiles_list)
+    with Pool(processes=64) as pool:
+        train_graph = list(tqdm(pool.imap(smile_to_graph, smiles_list), total=num_train))
+    
+    train_graph = to_pyg_list(train_graph,labels=labels_list)    
+    if FLAGS.output_file_name is not None:
+        print('----saving Featurized data -----')
+        torch.save(train_graph,os.path.join(FLAGS.output_folder,FLAGS.output_file_name))
 
-    #print('----saving Featurized data -----')
     
-    
-        
 if __name__ == "__main__":
     app.run(main)

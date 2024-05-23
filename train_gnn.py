@@ -1,22 +1,21 @@
+import math
 import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 import os
-from rdkit import Chem
-from rdkit.Chem.rdmolops import GetAdjacencyMatrix
 import torch
-from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool
-from torch.nn import BCEWithLogitsLoss
 from sklearn.metrics import average_precision_score, roc_auc_score
-import matplotlib.pyplot as plt
 from absl import app, flags
 import time
 import datetime
+from torch_scatter import scatter
+from multiprocessing import Pool
+from featurizing_data import *
 
 # Atom Featurisation
 ## Auxiliary function for one-hot enconding transformation based on list of
@@ -26,176 +25,193 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string(name="test_csv_for_ids_path", default="../data/test.csv", help="")
 flags.DEFINE_string(name="test_csv_path", default="../shrunken_data/test.csv", help="")
-flags.DEFINE_string(name="train_file_csv_path", default="../shrunken_data/train.csv", help="")
-flags.DEFINE_string(name="test_file_path", default="../gnn_data/test.pt", help="")
-flags.DEFINE_string(name="valid_file_path", default="../gnn_data/valid.pt", help="")
-flags.DEFINE_string(name="results_dir", default="results", help="")
-flags.DEFINE_string(name="output_file_name", default="ids_pred_results.csv", help="")
-flags.DEFINE_string(name="saving_model_path", default="ids_pred_results.csv", help="")
+flags.DEFINE_string(name="test_file_path", default="../gnn_data/test_byte.pt", help="")
 
+
+flags.DEFINE_string(name="train_file_path", default="../shrunken_data/train.csv", help="csv or pt")
+flags.DEFINE_string(name="valid_file_path", default="../gnn_data/valid.pt", help="")
+
+flags.DEFINE_string(name="results_dir", default="results", help="")
 
 
 flags.DEFINE_integer(name="featurizing_batch_size", default=256, help="")
-flags.DEFINE_integer(name="shard_size", default=100000, help="")
+flags.DEFINE_integer(name="shard_size", default=1000000, help="")
 flags.DEFINE_integer(name="dev_num", default=0, help="")
 
 
+flags.DEFINE_integer('emb_dim', 96, 'Dimension of the embeddings')
+flags.DEFINE_integer('num_epochs', 20, 'Number of epochs for training')
+flags.DEFINE_integer('num_layers', 4, 'Number of layers in the model')
+flags.DEFINE_float('dropout_rate', 0.3, 'Dropout rate for regularization')
+flags.DEFINE_float('lr', 0.001, 'Learning rate for training')
+flags.DEFINE_integer('out_channels', 3, 'Number of output channels')
+flags.DEFINE_integer('batch_size', 32, 'batch_size')
+
+flags.DEFINE_boolean(name="online_featurizing",default=False,help="")
+
+# torch version of np unpackbits
+#https://gist.github.com/vadimkantorov/30ea6d278bc492abf6ad328c6965613a
+
+def tensor_dim_slice(tensor, dim, dim_slice):
+	return tensor[(dim if dim >= 0 else dim + tensor.dim()) * (slice(None),) + (dim_slice,)]
+
+# @torch.jit.script
+def packshape(shape, dim: int = -1, mask: int = 0b00000001, dtype=torch.uint8, pack=True):
+	dim = dim if dim >= 0 else dim + len(shape)
+	bits, nibble = (
+		8 if dtype is torch.uint8 else 16 if dtype is torch.int16 else 32 if dtype is torch.int32 else 64 if dtype is torch.int64 else 0), (
+		1 if mask == 0b00000001 else 2 if mask == 0b00000011 else 4 if mask == 0b00001111 else 8 if mask == 0b11111111 else 0)
+	# bits = torch.iinfo(dtype).bits # does not JIT compile
+	assert nibble <= bits and bits % nibble == 0
+	nibbles = bits // nibble
+	shape = (shape[:dim] + (int(math.ceil(shape[dim] / nibbles)),) + shape[1 + dim:]) if pack else (
+				shape[:dim] + (shape[dim] * nibbles,) + shape[1 + dim:])
+	return shape, nibbles, nibble
+
+# @torch.jit.script
+def F_unpackbits(tensor, dim: int = -1, mask: int = 0b00000001, shape=None, out=None, dtype=torch.uint8):
+	dim = dim if dim >= 0 else dim + tensor.dim()
+	shape_, nibbles, nibble = packshape(tensor.shape, dim=dim, mask=mask, dtype=tensor.dtype, pack=False)
+	shape = shape if shape is not None else shape_
+	out = out if out is not None else torch.empty(shape, device=tensor.device, dtype=dtype)
+	assert out.shape == shape
+
+	if shape[dim] % nibbles == 0:
+		shift = torch.arange((nibbles - 1) * nibble, -1, -nibble, dtype=torch.uint8, device=tensor.device)
+		shift = shift.view(nibbles, *((1,) * (tensor.dim() - dim - 1)))
+		return torch.bitwise_and((tensor.unsqueeze(1 + dim) >> shift).view_as(out), mask, out=out)
+
+	else:
+		for i in range(nibbles):
+			shift = nibble * i
+			sliced_output = tensor_dim_slice(out, dim, slice(i, None, nibbles))
+			sliced_input = tensor.narrow(dim, 0, sliced_output.shape[dim])
+			torch.bitwise_and(sliced_input >> shift, mask, out=sliced_output)
+	return out
+
+class dotdict(dict):
+	__setattr__ = dict.__setitem__
+	__delattr__ = dict.__delitem__
+	
+	def __getattr__(self, name):
+		try:
+			return self[name]
+		except KeyError:
+			raise AttributeError(name)
 
 
-def one_hot_encoding(x, permitted_list):
-    """
-    Maps input elements x which are not in the permitted list to the last element
-    of the permitted list.
-    """
-    if x not in permitted_list:
-        x = permitted_list[-1]
-    binary_encoding = [int(boolean_value) for boolean_value in list(map(lambda s: x == s, permitted_list))]
-    return binary_encoding
-    
-    
-# Main atom feat. func
+#MODEL: simple MPNNModel
+#from https://github.com/chaitjo/geometric-gnn-dojo/blob/main/geometric_gnn_101.ipynb
 
-def get_atom_features(atom, use_chirality=True):
-    # Define a simplified list of atom types
-    permitted_atom_types = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I','Dy', 'Unknown']
-    atom_type = atom.GetSymbol() if atom.GetSymbol() in permitted_atom_types else 'Unknown'
-    atom_type_enc = one_hot_encoding(atom_type, permitted_atom_types)
-    
-    # Consider only the most impactful features: atom degree and whether the atom is in a ring
-    atom_degree = one_hot_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 'MoreThanFour'])
-    is_in_ring = [int(atom.IsInRing())]
-    
-    #print(atom_degree)
-    #exit()
-    # Optionally include chirality
-    if use_chirality:
-        chirality_enc = one_hot_encoding(str(atom.GetChiralTag()), ["CHI_UNSPECIFIED", "CHI_TETRAHEDRAL_CW", "CHI_TETRAHEDRAL_CCW", "CHI_OTHER"])
-        atom_features = atom_type_enc + atom_degree + is_in_ring + chirality_enc
-    else:
-        atom_features = atom_type_enc + atom_degree + is_in_ring
-    
-    return np.array(atom_features, dtype=np.float32)
+class MPNNLayer(MessagePassing):
+	def __init__(self, emb_dim=64, edge_dim=4, aggr='add'):
+		super().__init__(aggr=aggr)
 
-# Bond featurization
+		self.emb_dim = emb_dim
+		self.edge_dim = edge_dim
+		self.mlp_msg = nn.Sequential(
+			nn.Linear(2 * emb_dim + edge_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU(),
+			nn.Linear(emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU()
+		)
+		self.mlp_upd = nn.Sequential(
+			nn.Linear(2 * emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU(),
+			nn.Linear(emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU()
+		)
 
-def get_bond_features(bond):
-    # Simplified list of bond types
-    permitted_bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC, 'Unknown']
-    bond_type = bond.GetBondType() if bond.GetBondType() in permitted_bond_types else 'Unknown'
-    
-    # Features: Bond type, Is in a ring
-    features = one_hot_encoding(bond_type, permitted_bond_types) \
-               + [int(bond.IsInRing())]
-    
-    return np.array(features, dtype=np.float32)
+	def forward(self, h, edge_index, edge_attr):
+		out = self.propagate(edge_index, h=h, edge_attr=edge_attr)
+		return out
+
+	def message(self, h_i, h_j, edge_attr):
+		msg = torch.cat([h_i, h_j, edge_attr], dim=-1)
+		return self.mlp_msg(msg)
+
+	def aggregate(self, inputs, index):
+		return scatter(inputs, index, dim=self.node_dim, reduce=self.aggr)
+
+	def update(self, aggr_out, h):
+		upd_out = torch.cat([h, aggr_out], dim=-1)
+		return self.mlp_upd(upd_out)
+
+	def __repr__(self) -> str:
+		return (f'{self.__class__.__name__}(emb_dim={self.emb_dim}, aggr={self.aggr})')
 
 
-def create_pytorch_geometric_graph_data_list_from_smiles_and_labels(x_smiles, y=None):
-    data_list = []
-    
-    for index, smiles in enumerate(x_smiles):
-        mol = Chem.MolFromSmiles(smiles)
-        
-        if not mol:  # Skip invalid SMILES strings
-            continue
-        
-        # Node features
-        atom_features = [get_atom_features(atom) for atom in mol.GetAtoms()]
-        #atom_features = np.stack( atom_features, axis=0 )
-        x = torch.tensor(atom_features, dtype=torch.float)
-        
-        # Edge features
-        edge_index = []
-        edge_features = []
-        for bond in mol.GetBonds():
-            start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-            edge_index += [(start, end), (end, start)]  # Undirected graph
-            bond_feature = get_bond_features(bond)
-            edge_features += [bond_feature, bond_feature]  # Same features in both directions
-        
-        #edge_index = np.stack( edge_index, axis=0 )
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-        #edge_features = np.stack( edge_features, axis=0 )
-        edge_attr = torch.tensor(edge_features, dtype=torch.float)
-        
-        # Creating the Data object
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-        #data.molecule_id = ids[index]
-        if y is not None:
-            data.y = torch.tensor([y[index]], dtype=torch.float)
-        
-        data_list.append(data)
-    
-    return data_list
+class MPNNModel(nn.Module):
+	def __init__(self, num_layers=4, emb_dim=64, in_dim=11, edge_dim=4, out_dim=1):
+		super().__init__()
 
-def featurize_data_in_batches(smiles_list, labels_list, batch_size):
-    data_list = []
-    # Define tqdm progress bar
-    pbar = tqdm(total=len(smiles_list), desc="Featurizing data")
-    for i in range(0, len(smiles_list), batch_size):
-        smiles_batch = smiles_list[i:i+batch_size]
-        if labels_list is not None:
-            labels_batch = labels_list[i:i+batch_size]
-        else:
-            labels_batch = None
-        #ids_batch = ids_list[i:i+batch_size]
-        batch_data_list = create_pytorch_geometric_graph_data_list_from_smiles_and_labels(smiles_batch, labels_batch)
-        data_list.extend(batch_data_list)
-        pbar.update(len(smiles_batch))
-        
-    pbar.close()
-    return data_list
+		self.lin_in = nn.Linear(in_dim, emb_dim)
+
+		# Stack of MPNN layers
+		self.convs = torch.nn.ModuleList()
+		for layer in range(num_layers):
+			self.convs.append(MPNNLayer(emb_dim, edge_dim, aggr='add'))
+
+		self.pool = global_mean_pool
+
+	def forward(self, data): #PyG.Data - batch of PyG graphs
+
+		h = self.lin_in(F_unpackbits(data.x,-1).float())  
+
+		for conv in self.convs:
+			h = h + conv(h, data.edge_index.long(), F_unpackbits(data.edge_attr,-1).float())  # (n, d) -> (n, d)
+
+		h_graph = self.pool(h, data.batch)  
+		return h_graph
 
 
-class CustomGNNLayer(MessagePassing):
-    def __init__(self, in_channels, out_channels):
-        super(CustomGNNLayer, self).__init__(aggr='max')
-        self.lin = nn.Linear(in_channels + 6, out_channels)
 
-    def forward(self, x, edge_index, edge_attr):
-        # Start propagating messages
-        return MessagePassing.propagate(self, edge_index
-                                        , x=x, edge_attr=edge_attr)
+PACK_NODE_DIM=9
+PACK_EDGE_DIM=1
+NODE_DIM=PACK_NODE_DIM*8
+EDGE_DIM=PACK_EDGE_DIM*8
 
-    def message(self, x_j, edge_attr):
-        combined = torch.cat((x_j, edge_attr), dim=1)
-        return combined
-
-    def update(self, aggr_out):
-        return self.lin(aggr_out)
-
-#Define GNN Model
 class GNNModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, dropout_rate,out_channels=1):
-        super(GNNModel, self).__init__()
-        self.num_layers = num_layers
-        self.convs = nn.ModuleList([CustomGNNLayer(input_dim if i == 0 else hidden_dim, hidden_dim) for i in range(num_layers)])
-        self.dropout = nn.Dropout(dropout_rate)
-        self.bns = nn.ModuleList([nn.BatchNorm1d(hidden_dim) for _ in range(num_layers)])
-        self.lin = nn.Linear(hidden_dim, out_channels)
-        
-    def forward(self, data):
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        for i in range(self.num_layers):
-            x = self.convs[i](x, edge_index, edge_attr)
-            x = self.bns[i](x)
-            x = F.relu(x)
-            x = self.dropout(x)
-            
-        x = global_max_pool(x, data.batch) # Global pooling to get a graph-level representation
-        x = self.lin(x)
-        return x
+	def __init__(self, in_dim=NODE_DIM, edge_dim=EDGE_DIM, emb_dim=96, num_layers=4,out_channels=3,dropout = 0.1):
+		super().__init__()
+
+		self.output_type = ['infer', 'loss']
+
+		self.smile_encoder = MPNNModel(
+			 in_dim=in_dim, edge_dim=edge_dim, emb_dim=emb_dim, num_layers=num_layers,
+		)
+		self.bind = nn.Sequential(
+			nn.Linear(emb_dim, 1024),
+			#nn.BatchNorm1d(1024),
+			nn.ReLU(inplace=True),
+			nn.Dropout(dropout),
+			nn.Linear(1024, 1024),
+			#nn.BatchNorm1d(1024),
+			nn.ReLU(inplace=True),
+			nn.Dropout(dropout),
+			nn.Linear(1024, 512),
+			#nn.BatchNorm1d(512),
+			nn.ReLU(inplace=True),
+			nn.Dropout(dropout),
+			nn.Linear(512, out_channels),
+		)
+
+	def forward(self, batch):
+		x = self.smile_encoder(batch) 
+		bind = self.bind(x)
+
+		# --------------------------
+		output = {}
+		if 'loss' in self.output_type:
+			target = batch.y
+			output['bce_loss'] = F.binary_cross_entropy_with_logits(bind.float(), target.float())
+		if 'infer' in self.output_type:
+			output['bind'] = torch.sigmoid(bind)
+
+		return output
 
 
-
-
-def train_model(df_train, num_epochs,model, lr,results_dir,valid_loader,
-                featurizing_batch_size=64,training_batch_size=32,shard_size=10000,shuffle = True,device = 'cuda:1',es_patience = 3,):
+def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batch_size=32,shard_size=10000,device = 'cuda:1',es_patience = 3):
     
-    # define model and loss
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    criterion = BCEWithLogitsLoss()
-    
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+
     start_time = time.time()
 
     
@@ -208,37 +224,63 @@ def train_model(df_train, num_epochs,model, lr,results_dir,valid_loader,
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        if shuffle:
-            df_train = df_train.sample(frac=1)
+        
             
         shard_ind = 0
         num_mini_batches = 0
         # iteration over shard_size of the training samples
-        for i in range(0, len(df_train), shard_size):
-            shard_ind +=1
-            print(f"featurizing shard {shard_ind} / {len(df_train)// shard_size}")
-            df_train_shard = df_train[i:i+shard_size]
-            smiles_list_train = df_train_shard['molecule_smiles'].tolist()
-            labels_list = df_train_shard[['binds_BRD4','binds_HSA','binds_sEH']].values
-            train_data = featurize_data_in_batches(smiles_list_train, labels_list, featurizing_batch_size)
+        if FLAGS.online_featurizing is False:
+            # shuffule
+            shard_size = len(training_set)
+        else:
+            training_set = training_set.sample(frac=1)
+
+        
+        for i in range(0, len(training_set), shard_size):
             
-            train_loader = DataLoader(train_data, batch_size=training_batch_size, shuffle=True)
+            # online featurization
+            if shard_size < len(training_set):
+                print(f"featurizing shard {shard_ind} / {len(training_set)// shard_size}")
+                df_train_shard = training_set[i:i+shard_size]
+                #print(len(df_train_shard))
+                #continue
+                smiles_list_train = df_train_shard['molecule_smiles'].tolist()
+                labels_list = df_train_shard[['binds_BRD4','binds_HSA','binds_sEH']].values
+                num_train= len(smiles_list_train)
+                with Pool(processes=32) as pool:
+                    train_data = list(pool.imap(smile_to_graph, smiles_list_train), total=num_train)
+                
+                train_data = to_pyg_list(train_data,labels=labels_list) 
+                shard_ind +=1
+            # load the whole featurized data
+            else:
+                train_data = training_set
+                
+            #exit()
+            
+            train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
 
             # iteration over the train_loader mini-batchs
-            print(f"Training on shard {shard_ind} / {len(df_train)// shard_size}")
+            print(f"Training on shard {shard_ind} / {len(training_set)// shard_size}")
             for batch in train_loader:
                 num_mini_batches +=1
-                optimizer.zero_grad()
                 batch = batch.to(device)
-                out = model(batch)
-                #loss = criterion(out, batch.y.view(-1, 1).float()) # ??
-                loss = criterion(out, batch.y.float())
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
+                model.output_type = ['loss', 'infer']
+                with torch.cuda.amp.autocast(enabled=True):
+                    output = model(batch)  #data_parallel(net,batch) #
+                    bce_loss = output['bce_loss']
+
+                optimizer.zero_grad() 
+                scaler.scale(bce_loss).backward() 
+                scaler.step(optimizer)
+                scaler.update()
+                
+                torch.clear_autocast_cache()
+                total_loss += bce_loss.item()
  
  
         # validation
+        print('Validation')
         val_predictions, labels= predict_with_model(model, valid_loader,device,is_labeled=True)
         metrics = {
                     "roc_auc_score": roc_auc_score(y_true=labels, y_score=val_predictions),
@@ -276,17 +318,18 @@ def train_model(df_train, num_epochs,model, lr,results_dir,valid_loader,
         else:
             patience -= 1
             if patience == 0:
-                print('Early stopping. Best Val roc_auc: {:.4f}'.format(best_val))
+                print('Early stopping. Best Val aP: {:.4f}'.format(best_val))
                 break  
 
       
     
     torch.save(val_ap_list, os.path.join(results_dir,'val_ap_list.pt'))  
     torch.save(val_roc_list, os.path.join(results_dir,'val_roc_list.pt'))  
-    return model
+    #return model
 
 def predict_with_model(model, test_loader,device,is_labeled = False):
     model.eval()
+    model.output_type = ['infer']
     predictions = []
     if is_labeled:
         true_labels = []
@@ -294,8 +337,9 @@ def predict_with_model(model, test_loader,device,is_labeled = False):
 
     with torch.no_grad():
         for data in tqdm(test_loader):
-            output = torch.sigmoid(model(data.to(device)))
-            predictions.extend(output.view(-1).tolist())
+            
+            output =  model(data.to(device))
+            predictions.extend(output['bind'].view(-1).tolist())
             if is_labeled:
                 true_labels.extend(data.y.view(-1).tolist())
             #molecule_ids.extend(data.molecule_id)
@@ -328,42 +372,38 @@ def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_
     return y_pred_and_ids_df
 
 def main(argv):
-    print('loading training samples')    
-
-    df_train = pd.read_csv(FLAGS.train_file_csv_path)
-    
-    # simple featurization to get input dimension
-    df_train_simple = df_train[:128]
-    smiles_list_train = df_train_simple['molecule_smiles'].tolist()
-    labels_list = df_train_simple[['binds_BRD4','binds_HSA','binds_sEH']].values
-    train_data = featurize_data_in_batches(smiles_list_train, labels_list, 64)
-    
+ 
     # ---hyper-parameters
-    input_dim = train_data[0].num_node_features
-    hidden_dim = 64
-    num_epochs = 20
-    num_layers = 4 #Should ideally be set so that all nodes can communicate with each other
-    dropout_rate = 0.3
-    lr = 0.001
-    out_channels =3
+    input_dim = NODE_DIM
+    edge_dim = EDGE_DIM
     
     device = "cuda:"+str(FLAGS.dev_num)
     # define model
-    model = GNNModel(input_dim, hidden_dim, num_layers, dropout_rate,out_channels).to(device)
+    #model = GNNModel(input_dim, hidden_dim, num_layers, dropout_rate,out_channels).to(device)
+    model = GNNModel(in_dim=input_dim, edge_dim=edge_dim, emb_dim=FLAGS.emb_dim, num_layers=FLAGS.num_layers,
+                     out_channels = FLAGS.out_channels,dropout=FLAGS.dropout_rate).to(device)
 
     os.makedirs(FLAGS.results_dir, exist_ok=True)
 
     print('loading validation samples')    
     #------ validation set loading
     valid_data = torch.load(FLAGS.valid_file_path)
-    valid_loader = DataLoader(valid_data, batch_size=32, shuffle=False)
+    valid_loader = DataLoader(valid_data, batch_size=FLAGS.batch_size, shuffle=False)
+
+    print('loading training samples')    
+    if FLAGS.online_featurizing:
+        df_train = pd.read_csv(FLAGS.train_file_path)
+    else:
+        df_train = torch.load(FLAGS.train_file_path)
+
 
     # --- Training
     #model = train_model(train_loader,num_epochs, input_dim, hidden_dim,num_layers, dropout_rate,out_channels, lr)
-    model = train_model(df_train=df_train, model=model,valid_loader=valid_loader, lr=lr,num_epochs=num_epochs,featurizing_batch_size=FLAGS.featurizing_batch_size
-                        ,training_batch_size=32,shard_size=FLAGS.shard_size,shuffle = True,device = device,results_dir = FLAGS.results_dir)
+    train_model(training_set=df_train, model=model,valid_loader=valid_loader, lr=FLAGS.lr,num_epochs=FLAGS.num_epochs
+                        ,batch_size=FLAGS.batch_size,shard_size=FLAGS.shard_size
+                        ,device = device,results_dir = FLAGS.results_dir)
     
-    
+    model.load_state_dict(torch.load(os.path.join(FLAGS.results_dir,'best_val.pth')))  # Loading best model of this fold
     
     # ----- Test set predictions ---
     if FLAGS.test_file_path is not None:
@@ -377,8 +417,7 @@ def main(argv):
         predictions = predict_with_model(model, test_loader,device=device)
         
         # save predictions
-        _ = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path,results_dir = FLAGS.results_dir
-                                                ,output_file_name = FLAGS.output_file_name)
+        _ = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path,results_dir = FLAGS.results_dir)
 
         
 if __name__ == "__main__":
