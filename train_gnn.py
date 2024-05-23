@@ -193,19 +193,42 @@ class GNNModel(nn.Module):
 		)
 
 	def forward(self, batch):
-		x = self.smile_encoder(batch) 
+		graph = batch['graph']
+		x = self.smile_encoder(graph) 
 		bind = self.bind(x)
-
 		# --------------------------
 		output = {}
 		if 'loss' in self.output_type:
-			target = batch.y
+			target = batch['bind']
 			output['bce_loss'] = F.binary_cross_entropy_with_logits(bind.float(), target.float())
 		if 'infer' in self.output_type:
 			output['bind'] = torch.sigmoid(bind)
 
 		return output
 
+def my_collate(graph, index=None, device='cpu'):
+    if index is None:
+        index = np.arange(len(graph)).tolist()
+    batch = dotdict(
+        x=[],
+        edge_index=[],
+        edge_attr=[],
+        batch=[],
+        idx=index
+    )
+    offset = 0
+    for b, i in enumerate(index):
+        N, edge, node_feature, edge_feature = graph[i]
+        batch.x.append(node_feature)
+        batch.edge_attr.append(edge_feature)
+        batch.edge_index.append(edge.astype(int) + offset)
+        batch.batch += N * [b]
+        offset += N
+    batch.x = torch.from_numpy(np.concatenate(batch.x)).to(device)
+    batch.edge_attr = torch.from_numpy(np.concatenate(batch.edge_attr)).to(device)
+    batch.edge_index = torch.from_numpy(np.concatenate(batch.edge_index).T).to(device)
+    batch.batch = torch.LongTensor(batch.batch).to(device)
+    return batch
 
 def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batch_size=32,shard_size=10000,device = 'cuda:1',es_patience = 3):
     
@@ -230,10 +253,13 @@ def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batc
         num_mini_batches = 0
         # iteration over shard_size of the training samples
         if FLAGS.online_featurizing is False:
-            # shuffule
             shard_size = len(training_set)
         else:
+            # shuffule
             training_set = training_set.sample(frac=1)
+        
+        train_idx = np.array(training_set.index)
+
 
         
         for i in range(0, len(training_set), shard_size):
@@ -247,10 +273,11 @@ def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batc
                 smiles_list_train = df_train_shard['molecule_smiles'].tolist()
                 labels_list = df_train_shard[['binds_BRD4','binds_HSA','binds_sEH']].values
                 num_train= len(smiles_list_train)
+                #print(smiles_list_train)
                 with Pool(processes=32) as pool:
                     train_data = list(pool.imap(smile_to_graph, smiles_list_train), total=num_train)
                 
-                train_data = to_pyg_list(train_data,labels=labels_list) 
+                #train_data = to_pyg_list(train_data,labels=labels_list) 
                 shard_ind +=1
             # load the whole featurized data
             else:
@@ -258,14 +285,20 @@ def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batc
                 
             #exit()
             
-            train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+            #train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
 
             # iteration over the train_loader mini-batchs
             print(f"Training on shard {shard_ind} / {len(training_set)// shard_size}")
-            for batch in train_loader:
+            #for batch in train_loader:
+            for t, index in enumerate(np.arange(0,len(smiles_list_train),batch_size)):
+                index_batch = train_idx[index:index+batch_size]
                 num_mini_batches +=1
                 batch = batch.to(device)
                 model.output_type = ['loss', 'infer']
+                batch = dotdict(
+                    graph = my_collate(train_data,index_batch,device='cuda'),
+                    bind = torch.from_numpy(labels_list[index]).float().cuda(),
+                )
                 with torch.cuda.amp.autocast(enabled=True):
                     output = model(batch)  #data_parallel(net,batch) #
                     bce_loss = output['bce_loss']
@@ -341,7 +374,7 @@ def predict_with_model(model, test_loader,device,is_labeled = False):
             output =  model(data.to(device))
             predictions.extend(output['bind'].view(-1).tolist())
             if is_labeled:
-                true_labels.extend(data.y.view(-1).tolist())
+                true_labels.extend(data['bind'].view(-1).tolist())
             #molecule_ids.extend(data.molecule_id)
     if is_labeled:
         return predictions,true_labels
@@ -392,14 +425,14 @@ def main(argv):
 
     print('loading training samples')    
     if FLAGS.online_featurizing:
-        df_train = pd.read_csv(FLAGS.train_file_path)
+        training_set = pd.read_csv(FLAGS.train_file_path)
     else:
-        df_train = torch.load(FLAGS.train_file_path)
+        training_set = torch.load(FLAGS.train_file_path)
 
 
     # --- Training
     #model = train_model(train_loader,num_epochs, input_dim, hidden_dim,num_layers, dropout_rate,out_channels, lr)
-    train_model(training_set=df_train, model=model,valid_loader=valid_loader, lr=FLAGS.lr,num_epochs=FLAGS.num_epochs
+    train_model(training_set=training_set, model=model,valid_loader=valid_loader, lr=FLAGS.lr,num_epochs=FLAGS.num_epochs
                         ,batch_size=FLAGS.batch_size,shard_size=FLAGS.shard_size
                         ,device = device,results_dir = FLAGS.results_dir)
     
