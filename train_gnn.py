@@ -138,34 +138,33 @@ class MPNNLayer(MessagePassing):
 
 
 class MPNNModel(nn.Module):
-	def __init__(self, num_layers=4, emb_dim=64, in_dim=11, edge_dim=4, out_dim=1):
-		super().__init__()
+    def __init__(self, num_layers=4, emb_dim=64, in_dim=11, edge_dim=4, out_dim=1):
+        super().__init__()
 
-		self.lin_in = nn.Linear(in_dim, emb_dim)
+        self.lin_in = nn.Linear(in_dim, emb_dim)
 
-		# Stack of MPNN layers
-		self.convs = torch.nn.ModuleList()
-		for layer in range(num_layers):
-			self.convs.append(MPNNLayer(emb_dim, edge_dim, aggr='add'))
+        # Stack of MPNN layers
+        self.convs = torch.nn.ModuleList()
+        for layer in range(num_layers):
+            self.convs.append(MPNNLayer(emb_dim, edge_dim, aggr='add'))
 
-		self.pool = global_mean_pool
+        self.pool = global_mean_pool
 
-	def forward(self, data): #PyG.Data - batch of PyG graphs
+    def forward(self, data): #PyG.Data - batch of PyG graphs
+        h = self.lin_in(F_unpackbits(data.x,-1).float()[:,:36])  
 
-		h = self.lin_in(F_unpackbits(data.x,-1).float())  
+        for conv in self.convs:
+            h = h + conv(h, data.edge_index.long(), F_unpackbits(data.edge_attr,-1).float()[:,:6])  # (n, d) -> (n, d)
 
-		for conv in self.convs:
-			h = h + conv(h, data.edge_index.long(), F_unpackbits(data.edge_attr,-1).float())  # (n, d) -> (n, d)
-
-		h_graph = self.pool(h, data.batch)  
-		return h_graph
-
+        h_graph = self.pool(h, data.batch)  
+        return h_graph
 
 
-PACK_NODE_DIM=9
+
+PACK_NODE_DIM=5
 PACK_EDGE_DIM=1
-NODE_DIM=PACK_NODE_DIM*8
-EDGE_DIM=PACK_EDGE_DIM*8
+NODE_DIM=PACK_NODE_DIM*8-4
+EDGE_DIM=PACK_EDGE_DIM*8-2
 
 class GNNModel(nn.Module):
 	def __init__(self, in_dim=NODE_DIM, edge_dim=EDGE_DIM, emb_dim=96, num_layers=4,out_channels=3,dropout = 0.1):
@@ -230,7 +229,7 @@ def my_collate(graph, index=None, device='cpu'):
     batch.batch = torch.LongTensor(batch.batch).to(device)
     return batch
 
-def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batch_size=32,shard_size=10000,device = 'cuda:1',es_patience = 3):
+def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,device = 'cuda:1',es_patience = 8,train_frac = 0.9):
     
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
@@ -241,99 +240,89 @@ def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batc
     best_val = None
     patience = es_patience 
     val_ap_list = []
-    val_roc_list = []
+    binds_BRD4_AP_list = []
+    binds_HSA_AP_list = []
+    binds_sEH_AP_list = []
+    
+    SAMPLE = 75000000
+    training_set = training_set[:SAMPLE]
+    smiles_list_train = training_set['molecule_smiles'].tolist()
+    labels_list = training_set[['binds_BRD4','binds_HSA','binds_sEH']].values
+   
+   
+    print('----Featurizing training data -----')
+    with Pool(processes=64) as pool:
+        train_data = list(pool.imap(smile_to_graph, smiles_list_train))
+    
+    
+    # random splitting
+    num_train = int(train_frac * len(training_set))
+    rng = np.random.RandomState(123)
+    index = np.arange(len(training_set))
+    rng.shuffle(index)
+    train_idx = index[:num_train]
+    val_idx = index[num_train:]
+
+    #train_idx = np.array(training_set.index)[:95000]
+    #val_idx = np.array(training_set.index)[:5000]
+
 
     # iteration over the training samples
     for epoch in range(num_epochs):
+        np.random.shuffle(train_idx)
+
         model.train()
         total_loss = 0
-        
-            
-        shard_ind = 0
+        #shard_ind = 0
         num_mini_batches = 0
-        # iteration over shard_size of the training samples
-        if FLAGS.online_featurizing is False:
-            shard_size = len(training_set)
-        else:
-            # shuffule
-            training_set = training_set.sample(frac=1)
-        
-        train_idx = np.array(training_set.index)
-
-
-        
-        for i in range(0, len(training_set), shard_size):
+  
+        for index in np.arange(0,len(train_idx),batch_size):
+            index_batch = train_idx[index:index+batch_size]
+            num_mini_batches +=1
+            batch = dotdict(
+                graph = my_collate(train_data,index_batch,device=device),
+                bind = torch.from_numpy(labels_list[index_batch]).float().to(device),
+            )
+            #batch = batch.to(device)
+            model.output_type = ['loss', 'infer']
             
-            # online featurization
-            if shard_size < len(training_set):
-                print(f"featurizing shard {shard_ind} / {len(training_set)// shard_size}")
-                df_train_shard = training_set[i:i+shard_size]
-                #print(len(df_train_shard))
-                #continue
-                smiles_list_train = df_train_shard['molecule_smiles'].tolist()
-                labels_list = df_train_shard[['binds_BRD4','binds_HSA','binds_sEH']].values
-                num_train= len(smiles_list_train)
-                #print(smiles_list_train)
-                with Pool(processes=32) as pool:
-                    train_data = list(pool.imap(smile_to_graph, smiles_list_train), total=num_train)
-                
-                #train_data = to_pyg_list(train_data,labels=labels_list) 
-                shard_ind +=1
-            # load the whole featurized data
-            else:
-                train_data = training_set
-                
-            #exit()
+            with torch.cuda.amp.autocast(enabled=True):
+                output = model(batch)  #data_parallel(net,batch) #
+                bce_loss = output['bce_loss']
+
+            optimizer.zero_grad() 
+            scaler.scale(bce_loss).backward() 
+            scaler.step(optimizer)
+            scaler.update()
             
-            #train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-
-            # iteration over the train_loader mini-batchs
-            print(f"Training on shard {shard_ind} / {len(training_set)// shard_size}")
-            #for batch in train_loader:
-            for t, index in enumerate(np.arange(0,len(smiles_list_train),batch_size)):
-                index_batch = train_idx[index:index+batch_size]
-                num_mini_batches +=1
-                batch = batch.to(device)
-                model.output_type = ['loss', 'infer']
-                batch = dotdict(
-                    graph = my_collate(train_data,index_batch,device='cuda'),
-                    bind = torch.from_numpy(labels_list[index]).float().cuda(),
-                )
-                with torch.cuda.amp.autocast(enabled=True):
-                    output = model(batch)  #data_parallel(net,batch) #
-                    bce_loss = output['bce_loss']
-
-                optimizer.zero_grad() 
-                scaler.scale(bce_loss).backward() 
-                scaler.step(optimizer)
-                scaler.update()
-                
-                torch.clear_autocast_cache()
-                total_loss += bce_loss.item()
+            torch.clear_autocast_cache()
+            total_loss += bce_loss.item()
  
  
         # validation
         print('Validation')
-        val_predictions, labels= predict_with_model(model, valid_loader,device,is_labeled=True)
-        metrics = {
-                    "roc_auc_score": roc_auc_score(y_true=labels, y_score=val_predictions),
-                    "average_precision_score": average_precision_score(
-                        y_true=labels, y_score=val_predictions,average='micro'
-                    ),
-                }
+        val_predictions= predict_with_model(model, train_data,device,val_idx,1024)
+        labels = torch.tensor(labels_list[val_idx]).view(-1).tolist()
+        binds_BRD4_AP  = average_precision_score(y_true=labels[0::3], y_score=val_predictions[0::3],average='macro')
+        binds_HSA_AP  = average_precision_score(y_true=labels[1::3], y_score=val_predictions[1::3],average='macro')
+        binds_sEH_AP = average_precision_score(y_true=labels[2::3], y_score=val_predictions[2::3],average='macro')
         
         # During the first iteration (first epoch) best validation is set to None
-        val_ap = metrics["average_precision_score"]
-        val_roc = metrics["roc_auc_score"]
-        val_ap_list.append(val_ap)
-        val_roc_list.append(val_roc)
+        binds_BRD4_AP_list.append(binds_BRD4_AP)
+        binds_HSA_AP_list.append(binds_HSA_AP)
+        binds_sEH_AP_list.append(binds_sEH_AP)
         
+        val_ap = np.mean([binds_BRD4_AP,binds_HSA_AP,binds_sEH_AP])
+        val_ap_list.append(val_ap)
+
         #print(f'Epoch {epoch+1}/{num_epochs}, Loss: {total_loss / num_mini_batches}')
-        print('Epoch {:03}: | Loss: {:.5f} | Val Ap: {:.5f} | Val roc: {:.5f}  | Training time: {}'.format(
+        print('Epoch {:03}: | Loss: {:.5f} | binds_BRD4_AP: {:.5f} | binds_HSA_AP: {:.5f} | binds_sEH_AP: {:.5f} | mAP: {:.5f}  | Training time: {}'.format(
             epoch + 1, 
             total_loss/num_mini_batches, 
-            val_ap, 
-            val_roc,
+            binds_BRD4_AP, 
+            binds_HSA_AP,
+            binds_sEH_AP,
+            val_ap,
             str(datetime.timedelta(seconds=time.time() - start_time))[:7]))
 
 
@@ -353,35 +342,40 @@ def train_model(training_set, num_epochs,model, lr,results_dir,valid_loader,batc
             if patience == 0:
                 print('Early stopping. Best Val aP: {:.4f}'.format(best_val))
                 break  
+        
+        torch.save(model.state_dict(), os.path.join(results_dir,'Epoch_'+str(epoch+1)+'.pth'))  # Saving the model
+
 
       
-    
-    torch.save(val_ap_list, os.path.join(results_dir,'val_ap_list.pt'))  
-    torch.save(val_roc_list, os.path.join(results_dir,'val_roc_list.pt'))  
+    df = pd.DataFrame(val_ap_list)
+    df.to_csv(os.path.join(results_dir,'val_ap_list.csv'), index=False)
+    df = pd.DataFrame(binds_BRD4_AP_list)
+    df.to_csv(os.path.join(results_dir,'binds_BRD4_AP_list.csv'), index=False)
+    df = pd.DataFrame(binds_HSA_AP_list)
+    df.to_csv(os.path.join(results_dir,'binds_HSA_AP_list.csv'), index=False)
+    df = pd.DataFrame(binds_sEH_AP_list)
+    df.to_csv(os.path.join(results_dir,'binds_sEH_AP_list.csv'), index=False)
+
+    #torch.save(val_ap_list, os.path.join(results_dir,'val_ap_list.pt'))  
     #return model
 
-def predict_with_model(model, test_loader,device,is_labeled = False):
+def predict_with_model(model, data,device,idx,batch_size = 32):
     model.eval()
     model.output_type = ['infer']
     predictions = []
-    if is_labeled:
-        true_labels = []
-    #molecule_ids = []
 
     with torch.no_grad():
-        for data in tqdm(test_loader):
-            
-            output =  model(data.to(device))
+        for t, index in enumerate(np.arange(0,len(idx),batch_size)):
+            index_batch = idx[index:index+batch_size]
+            batch = dotdict(
+                graph = my_collate(data,index_batch,device=device),
+            )
+            output = model(batch) 
             predictions.extend(output['bind'].view(-1).tolist())
-            if is_labeled:
-                true_labels.extend(data['bind'].view(-1).tolist())
-            #molecule_ids.extend(data.molecule_id)
-    if is_labeled:
-        return predictions,true_labels
-    else:
-        return predictions
 
-def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_ids,results_dir = 'results/',output_file_name ='ids_pred_results.csv'):
+    return predictions
+
+def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_ids):
     
     #Combine predictions with the bools
     bool_cols  = test_df[['is_BRD4','is_HSA','is_sEH']]
@@ -399,9 +393,7 @@ def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_
     test_ids = pd.DataFrame(test.id)
     assert len(y_pred_df)==len(test_ids)
     y_pred_and_ids_df = pd.concat([test_ids,y_pred_df],axis=1)
-    
-    output_path = os.path.join(results_dir,output_file_name)
-    y_pred_and_ids_df.to_csv(output_path,index=False)
+
     return y_pred_and_ids_df
 
 def main(argv):
@@ -418,23 +410,22 @@ def main(argv):
 
     os.makedirs(FLAGS.results_dir, exist_ok=True)
 
-    print('loading validation samples')    
+    #print('loading validation samples')    
     #------ validation set loading
-    valid_data = torch.load(FLAGS.valid_file_path)
-    valid_loader = DataLoader(valid_data, batch_size=FLAGS.batch_size, shuffle=False)
+    #valid_data = torch.load(FLAGS.valid_file_path)
+    #valid_loader = DataLoader(valid_data, batch_size=FLAGS.batch_size, shuffle=False)
 
     print('loading training samples')    
-    if FLAGS.online_featurizing:
-        training_set = pd.read_csv(FLAGS.train_file_path)
-    else:
-        training_set = torch.load(FLAGS.train_file_path)
+    #if FLAGS.online_featurizing:
+    training_set = pd.read_csv(FLAGS.train_file_path)
+    #else:
+    #training_set = torch.load(FLAGS.train_file_path)
 
 
     # --- Training
     #model = train_model(train_loader,num_epochs, input_dim, hidden_dim,num_layers, dropout_rate,out_channels, lr)
-    train_model(training_set=training_set, model=model,valid_loader=valid_loader, lr=FLAGS.lr,num_epochs=FLAGS.num_epochs
-                        ,batch_size=FLAGS.batch_size,shard_size=FLAGS.shard_size
-                        ,device = device,results_dir = FLAGS.results_dir)
+    train_model(training_set=training_set, model=model, lr=FLAGS.lr,num_epochs=FLAGS.num_epochs
+                        ,batch_size=FLAGS.batch_size,device = device,results_dir = FLAGS.results_dir)
     
     model.load_state_dict(torch.load(os.path.join(FLAGS.results_dir,'best_val.pth')))  # Loading best model of this fold
     
@@ -442,16 +433,24 @@ def main(argv):
     if FLAGS.test_file_path is not None:
         print('Predicting on test samples')    
         print('loading test samples')    
-        test_data = torch.load(FLAGS.test_file_path)
         test_df = pd.read_csv(FLAGS.test_csv_path)
+
+        smiles_list_test = test_df['molecule_smiles'].tolist()
+        #print(smiles_list_train)
+        print('----Featurizing testing data -----')
+        with Pool(processes=64) as pool:
+            test_data = list(pool.imap(smile_to_graph, smiles_list_test))
         
         # Predict
-        test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
-        predictions = predict_with_model(model, test_loader,device=device)
+        #test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
+        test_idx = np.array(test_df.index)
+        predictions = predict_with_model(model, test_data,device,test_idx)
         
         # save predictions
-        _ = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path,results_dir = FLAGS.results_dir)
+        y_pred_and_ids_df = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path)
 
+        output_path = os.path.join(FLAGS.results_dir,'ids_pred_results.csv')
+        y_pred_and_ids_df.to_csv(output_path,index=False)
         
 if __name__ == "__main__":
     app.run(main)

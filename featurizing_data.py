@@ -80,7 +80,7 @@ class dotdict(dict):
 # mol to graph adopted from
 # from https://github.com/LiZhang30/GPCNDTA/blob/main/utils/DrugGraph.py
 
-PACK_NODE_DIM=9
+PACK_NODE_DIM= 5 #9
 PACK_EDGE_DIM=1
 NODE_DIM=PACK_NODE_DIM*8
 EDGE_DIM=PACK_EDGE_DIM*8
@@ -106,14 +106,17 @@ def one_of_k_encoding(x, allowable_set, allow_unk=False):
 	Total: 70 dimensions
 '''
 
-ATOM_SYMBOL = [
+'''ATOM_SYMBOL = [
 	'C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg',
 	'Na', 'Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl',
 	'Yb', 'Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H',
 	'Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr', 'Cr',
 	'Pt', 'Hg', 'Pb', 'Dy',
 	#'Unknown'
-]
+]'''
+
+ATOM_SYMBOL = ['B', 'Br', 'C', 'Cl', 'Dy', 'F', 'I', 'N', 'O', 'S', 'Si']
+
 #print('ATOM_SYMBOL', len(ATOM_SYMBOL))44
 HYBRIDIZATION_TYPE = [
 	Chem.rdchem.HybridizationType.S,
@@ -172,12 +175,12 @@ def smile_to_graph(smiles):
 	node_feature = []
 	edge_feature = []
 	edge = []
-	for i in range(mol.GetNumAtoms()):
+	for i in range(N):
 		atom_i = mol.GetAtomWithIdx(i)
 		atom_i_features = get_atom_feature(atom_i)
 		node_feature.append(atom_i_features)
 
-		for j in range(mol.GetNumAtoms()):
+		for j in range(N):
 			bond_ij = mol.GetBondBetweenAtoms(i, j)
 			if bond_ij is not None:
 				edge.append([i, j])
