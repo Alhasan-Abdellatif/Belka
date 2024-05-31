@@ -3,17 +3,19 @@ import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 import os
 import torch
-from torch_geometric.loader import DataLoader
+#from torch_geometric.loader import DataLoader
+from torch.utils.data import TensorDataset, Dataset, DataLoader
+
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool
+#from torch_geometric.nn import MessagePassing, global_mean_pool, global_max_pool
 from sklearn.metrics import average_precision_score, roc_auc_score
 from absl import app, flags
 import time
 import datetime
-from torch_scatter import scatter
+#from torch_scatter import scatter
 from multiprocessing import Pool
 from featurizing_data import *
 
@@ -48,6 +50,13 @@ flags.DEFINE_integer('out_channels', 3, 'Number of output channels')
 flags.DEFINE_integer('batch_size', 32, 'batch_size')
 
 flags.DEFINE_boolean(name="online_featurizing",default=False,help="")
+
+MAX_LEN = 142
+MAX_LEN = 130
+FEATURES = [f'enc{i}' for i in range(MAX_LEN)]
+TARGETS = ['bind1', 'bind2', 'bind3']
+#TARGETS = ['binds_BRD4','binds_HSA','binds_sEH']
+
 
 # torch version of np unpackbits
 #https://gist.github.com/vadimkantorov/30ea6d278bc492abf6ad328c6965613a
@@ -100,140 +109,45 @@ class dotdict(dict):
 			raise AttributeError(name)
 
 
-#MODEL: simple MPNNModel
-#from https://github.com/chaitjo/geometric-gnn-dojo/blob/main/geometric_gnn_101.ipynb
 
-class MPNNLayer(MessagePassing):
-	def __init__(self, emb_dim=64, edge_dim=4, aggr='add'):
-		super().__init__(aggr=aggr)
+class oneDCNN(nn.Module):
+    def __init__(self,num_embeddings=37, num_filters=32, hidden_dim=128):
+        super(oneDCNN, self).__init__()
+        self.embedding = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=hidden_dim, padding_idx=0)
+        self.conv1 = nn.Conv1d(in_channels=hidden_dim, out_channels=num_filters, kernel_size=3, padding=0, stride=1)
+        self.conv2 = nn.Conv1d(in_channels=num_filters, out_channels=num_filters*2, kernel_size=3, padding=0, stride=1)
+        self.conv3 = nn.Conv1d(in_channels=num_filters*2, out_channels=num_filters*3, kernel_size=3, padding=0, stride=1)
+        self.global_max_pool = nn.AdaptiveMaxPool1d(1)
+        self.fc1 = nn.Linear(num_filters*3, 1024)
+        self.fc2 = nn.Linear(1024, 1024)
+        self.fc3 = nn.Linear(1024, 512)
+        self.output = nn.Linear(512, 3)
+        self.dropout = nn.Dropout(0.1)
 
-		self.emb_dim = emb_dim
-		self.edge_dim = edge_dim
-		self.mlp_msg = nn.Sequential(
-			nn.Linear(2 * emb_dim + edge_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU(),
-			nn.Linear(emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU()
-		)
-		self.mlp_upd = nn.Sequential(
-			nn.Linear(2 * emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU(),
-			nn.Linear(emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU()
-		)
+    def forward(self, x):
+        #print(x.shape)
+        #print(torch.max(x))
+        #print(self.embedding(x).shape)
+        x = self.embedding(x).transpose(1, 2)  # Transpose for Conv1d
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.global_max_pool(x).squeeze(-1)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc3(x))
+        x = self.dropout(x)
+        #x = torch.sigmoid(self.output(x))
+        x = self.output(x)
+        return x
 
-	def forward(self, h, edge_index, edge_attr):
-		out = self.propagate(edge_index, h=h, edge_attr=edge_attr)
-		return out
-
-	def message(self, h_i, h_j, edge_attr):
-		msg = torch.cat([h_i, h_j, edge_attr], dim=-1)
-		return self.mlp_msg(msg)
-
-	def aggregate(self, inputs, index):
-		return scatter(inputs, index, dim=self.node_dim, reduce=self.aggr)
-
-	def update(self, aggr_out, h):
-		upd_out = torch.cat([h, aggr_out], dim=-1)
-		return self.mlp_upd(upd_out)
-
-	def __repr__(self) -> str:
-		return (f'{self.__class__.__name__}(emb_dim={self.emb_dim}, aggr={self.aggr})')
-
-
-class MPNNModel(nn.Module):
-    def __init__(self, num_layers=4, emb_dim=64, in_dim=11, edge_dim=4, out_dim=1):
-        super().__init__()
-
-        self.lin_in = nn.Linear(in_dim, emb_dim)
-
-        # Stack of MPNN layers
-        self.convs = torch.nn.ModuleList()
-        for layer in range(num_layers):
-            self.convs.append(MPNNLayer(emb_dim, edge_dim, aggr='add'))
-
-        self.pool = global_mean_pool
-
-    def forward(self, data): #PyG.Data - batch of PyG graphs
-        h = self.lin_in(F_unpackbits(data.x,-1).float()[:,:36])  
-
-        for conv in self.convs:
-            h = h + conv(h, data.edge_index.long(), F_unpackbits(data.edge_attr,-1).float()[:,:6])  # (n, d) -> (n, d)
-
-        h_graph = self.pool(h, data.batch)  
-        return h_graph
-
-
-
-PACK_NODE_DIM=5
-PACK_EDGE_DIM=1
-NODE_DIM=PACK_NODE_DIM*8-4
-EDGE_DIM=PACK_EDGE_DIM*8-2
-
-class GNNModel(nn.Module):
-	def __init__(self, in_dim=NODE_DIM, edge_dim=EDGE_DIM, emb_dim=96, num_layers=4,out_channels=3,dropout = 0.1):
-		super().__init__()
-
-		self.output_type = ['infer', 'loss']
-
-		self.smile_encoder = MPNNModel(
-			 in_dim=in_dim, edge_dim=edge_dim, emb_dim=emb_dim, num_layers=num_layers,
-		)
-		self.bind = nn.Sequential(
-			nn.Linear(emb_dim, 1024),
-			#nn.BatchNorm1d(1024),
-			nn.ReLU(inplace=True),
-			nn.Dropout(dropout),
-			nn.Linear(1024, 1024),
-			#nn.BatchNorm1d(1024),
-			nn.ReLU(inplace=True),
-			nn.Dropout(dropout),
-			nn.Linear(1024, 512),
-			#nn.BatchNorm1d(512),
-			nn.ReLU(inplace=True),
-			nn.Dropout(dropout),
-			nn.Linear(512, out_channels),
-		)
-
-	def forward(self, batch):
-		graph = batch['graph']
-		x = self.smile_encoder(graph) 
-		bind = self.bind(x)
-		# --------------------------
-		output = {}
-		if 'loss' in self.output_type:
-			target = batch['bind']
-			output['bce_loss'] = F.binary_cross_entropy_with_logits(bind.float(), target.float())
-		if 'infer' in self.output_type:
-			output['bind'] = torch.sigmoid(bind)
-
-		return output
-
-def my_collate(graph, index=None, device='cpu'):
-    if index is None:
-        index = np.arange(len(graph)).tolist()
-    batch = dotdict(
-        x=[],
-        edge_index=[],
-        edge_attr=[],
-        batch=[],
-        idx=index
-    )
-    offset = 0
-    for b, i in enumerate(index):
-        N, edge, node_feature, edge_feature = graph[i]
-        batch.x.append(node_feature)
-        batch.edge_attr.append(edge_feature)
-        batch.edge_index.append(edge.astype(int) + offset)
-        batch.batch += N * [b]
-        offset += N
-    batch.x = torch.from_numpy(np.concatenate(batch.x)).to(device)
-    batch.edge_attr = torch.from_numpy(np.concatenate(batch.edge_attr)).to(device)
-    batch.edge_index = torch.from_numpy(np.concatenate(batch.edge_index).T).to(device)
-    batch.batch = torch.LongTensor(batch.batch).to(device)
-    return batch
 
 def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,device = 'cuda:1',es_patience = 8,train_frac = 0.9):
     
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler(enabled=True)
-    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=4,verbose=True)
 
     start_time = time.time()
@@ -246,15 +160,17 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
     binds_HSA_AP_list = []
     binds_sEH_AP_list = []
     
-    SAMPLE = 75000
+    SAMPLE = len(training_set)
     training_set = training_set[:SAMPLE]
-    smiles_list_train = training_set['molecule_smiles'].tolist()
-    labels_list = training_set[['binds_BRD4','binds_HSA','binds_sEH']].values
+    #smiles_list_train = training_set['molecule_smiles'].tolist()
+    #labels_list = training_set[['binds_BRD4','binds_HSA','binds_sEH']].values
+    
+
    
    
-    print('----Featurizing training data -----')
-    with Pool(processes=64) as pool:
-        train_data = list(pool.imap(smile_to_graph, smiles_list_train))
+    #print('----Featurizing training data -----')
+    #with Pool(processes=64) as pool:
+    #    train_data = list(pool.imap(smile_to_graph, smiles_list_train))
     
     
     # random splitting
@@ -267,7 +183,27 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
 
     #train_idx = np.array(training_set.index)[:95000]
     #val_idx = np.array(training_set.index)[:5000]
+    
+     # Convert pandas dataframes to PyTorch tensors
+    
 
+    X_train = torch.tensor(training_set.loc[train_idx, FEATURES].values, dtype=torch.int)
+    y_train = torch.tensor(training_set.loc[train_idx, TARGETS].values, dtype=torch.float16)
+    X_val = torch.tensor(training_set.loc[val_idx, FEATURES].values, dtype=torch.int)
+    y_val = torch.tensor(training_set.loc[val_idx, TARGETS].values, dtype=torch.float16)
+    
+    # Create TensorDatasets
+    train_dataset = TensorDataset(X_train, y_train)
+    valid_dataset = TensorDataset(X_val, y_val)
+    
+    # Create DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
+        
+    
+    
+
+    print('----Starting training -----')
 
     # iteration over the training samples
     for epoch in range(num_epochs):
@@ -278,21 +214,23 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
         #shard_ind = 0
         num_mini_batches = 0
   
-        for index in np.arange(0,len(train_idx),batch_size):
-            index_batch = train_idx[index:index+batch_size]
+        #for index in np.arange(0,len(train_idx),batch_size):
+        for inputs, targets in train_loader: 
+            #index_batch = train_idx[index:index+batch_size]
             num_mini_batches +=1
-            batch = dotdict(
-                graph = my_collate(train_data,index_batch,device=device),
-                bind = torch.from_numpy(labels_list[index_batch]).float().to(device),
-            )
+            #batch = dotdict(
+            #    graph = my_collate(train_data,index_batch,device=device),
+            #    bind = torch.from_numpy(labels_list[index_batch]).float().to(device),
+            #)
             #batch = batch.to(device)
-            model.output_type = ['loss', 'infer']
-            
-            with torch.cuda.amp.autocast(enabled=True):
-                output = model(batch)  #data_parallel(net,batch) #
-                bce_loss = output['bce_loss']
-
+            #model.output_type = ['loss', 'infer']
             optimizer.zero_grad() 
+
+            with torch.cuda.amp.autocast(enabled=True):
+                #print(inputs)
+                output = model(inputs.to(device))  #data_parallel(net,batch) #
+                bce_loss = F.binary_cross_entropy_with_logits(output, targets.to(device))
+
             scaler.scale(bce_loss).backward() 
             scaler.step(optimizer)
             scaler.update()
@@ -303,8 +241,9 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
  
         # validation
         print('Validation')
-        val_predictions= predict_with_model(model, train_data,device,val_idx,1024)
-        labels = torch.tensor(labels_list[val_idx]).view(-1).tolist()
+        val_predictions= predict_with_model(model, valid_loader,device)
+        val_predictions = np.array(val_predictions).reshape(-1).tolist()
+        labels = y_val.reshape(-1).tolist()
         binds_BRD4_AP  = average_precision_score(y_true=labels[0::3], y_score=val_predictions[0::3],average='macro')
         binds_HSA_AP  = average_precision_score(y_true=labels[1::3], y_score=val_predictions[1::3],average='macro')
         binds_sEH_AP = average_precision_score(y_true=labels[2::3], y_score=val_predictions[2::3],average='macro')
@@ -318,7 +257,7 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
         val_ap_list.append(val_ap)
 
         #print(f'Epoch {epoch+1}/{num_epochs}, Loss: {total_loss / num_mini_batches}')
-        print('Epoch {:05}: | Loss: {:.5f} | binds_BRD4_AP: {:.5f} | binds_HSA_AP: {:.5f} | binds_sEH_AP: {:.5f} | mAP: {:.5f}  | Training time: {}'.format(
+        print('Epoch {:05}: | Loss: {:.7f} | binds_BRD4_AP: {:.5f} | binds_HSA_AP: {:.5f} | binds_sEH_AP: {:.5f} | mAP: {:.5f}  | Training time: {}'.format(
             epoch + 1, 
             total_loss/num_mini_batches, 
             binds_BRD4_AP, 
@@ -347,8 +286,6 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
         
         torch.save(model.state_dict(), os.path.join(results_dir,'Epoch_'+str(epoch+1)+'.pth'))  # Saving the model
         scheduler.step(val_ap)
-        #print(f"Epoch {epoch+1}, Learning Rate: {scheduler.get_last_lr()}")
-
 
 
       
@@ -364,21 +301,19 @@ def train_model(training_set, num_epochs,model, lr,results_dir,batch_size=32,dev
     #torch.save(val_ap_list, os.path.join(results_dir,'val_ap_list.pt'))  
     #return model
 
-def predict_with_model(model, data,device,idx,batch_size = 32):
+def predict_with_model(model, val_loader,device,):
     model.eval()
     model.output_type = ['infer']
     predictions = []
 
     with torch.no_grad():
-        for t, index in enumerate(np.arange(0,len(idx),batch_size)):
-            index_batch = idx[index:index+batch_size]
-            batch = dotdict(
-                graph = my_collate(data,index_batch,device=device),
-            )
-            output = model(batch) 
-            predictions.extend(output['bind'].view(-1).tolist())
+        #for t, index in enumerate(np.arange(0,len(idx),batch_size)):
+        for inputs in val_loader:  # Assuming you have a DataLoader named val_loader
+            output = model(inputs[0].to(device)) 
+            predictions.extend(torch.sigmoid(output).tolist())
 
     return predictions
+
 
 def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_ids):
     
@@ -404,14 +339,15 @@ def select_and_save_predictions_with_ids(predictions,test_df,path_test_file_for_
 def main(argv):
  
     # ---hyper-parameters
-    input_dim = NODE_DIM
-    edge_dim = EDGE_DIM
+    #input_dim = NODE_DIM
+    #edge_dim = EDGE_DIM
     
     device = "cuda:"+str(FLAGS.dev_num)
     # define model
     #model = GNNModel(input_dim, hidden_dim, num_layers, dropout_rate,out_channels).to(device)
-    model = GNNModel(in_dim=input_dim, edge_dim=edge_dim, emb_dim=FLAGS.emb_dim, num_layers=FLAGS.num_layers,
-                     out_channels = FLAGS.out_channels,dropout=FLAGS.dropout_rate).to(device)
+    #model = GNNModel(in_dim=input_dim, edge_dim=edge_dim, emb_dim=FLAGS.emb_dim, num_layers=FLAGS.num_layers,
+    #                 out_channels = FLAGS.out_channels,dropout=FLAGS.dropout_rate).to(device)
+    model = oneDCNN(FLAGS.emb_dim).to(device)
 
     os.makedirs(FLAGS.results_dir, exist_ok=True)
 
@@ -422,7 +358,9 @@ def main(argv):
 
     print('loading training samples')    
     #if FLAGS.online_featurizing:
-    training_set = pd.read_csv(FLAGS.train_file_path)
+    #training_set = pd.read_csv(FLAGS.train_file_path)
+    training_set = pd.read_parquet(FLAGS.train_file_path)
+    
     #else:
     #training_set = torch.load(FLAGS.train_file_path)
 
@@ -438,24 +376,25 @@ def main(argv):
     if FLAGS.test_file_path is not None:
         print('Predicting on test samples')    
         print('loading test samples')    
-        test_df = pd.read_csv(FLAGS.test_csv_path)
-
-        smiles_list_test = test_df['molecule_smiles'].tolist()
-        #print(smiles_list_train)
-        print('----Featurizing testing data -----')
-        with Pool(processes=64) as pool:
-            test_data = list(pool.imap(smile_to_graph, smiles_list_test))
-        
-        # Predict
-        #test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
-        test_idx = np.array(test_df.index)
-        predictions = predict_with_model(model, test_data,device,test_idx)
-        
-        # save predictions
-        y_pred_and_ids_df = select_and_save_predictions_with_ids(predictions,test_df,FLAGS.test_csv_for_ids_path)
-
+        #test_df = pd.read_csv(FLAGS.test_csv_path)
+         
+        test_data = pd.read_parquet(FLAGS.test_file_path)
+        test_idx = np.array(test_data.index)
+        X_test = torch.tensor(test_data.loc[test_idx, FEATURES].values, dtype=torch.int)
+        # Create TensorDatasets
+        test_dataset = TensorDataset(X_test)
+        tst = pd.read_csv(FLAGS.test_csv_for_ids_path,index_col=False)#[:len(y_pred_df)]
+        test_loader = DataLoader(test_dataset, batch_size=1024, shuffle=False)
+        predictions = predict_with_model(model, test_loader,device)
+        predictions = np.array(predictions)
+        tst['binds'] = 0
+        tst.loc[tst['protein_name']=='BRD4', 'binds'] = predictions[(tst['protein_name']=='BRD4').values, 0]
+        tst.loc[tst['protein_name']=='HSA', 'binds'] = predictions[(tst['protein_name']=='HSA').values, 1]
+        tst.loc[tst['protein_name']=='sEH', 'binds'] = predictions[(tst['protein_name']=='sEH').values, 2]
         output_path = os.path.join(FLAGS.results_dir,'ids_pred_results.csv')
-        y_pred_and_ids_df.to_csv(output_path,index=False)
+        tst[['id', 'binds']].to_csv(output_path, index = False)
+
+       
         
 if __name__ == "__main__":
     app.run(main)
